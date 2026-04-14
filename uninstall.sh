@@ -154,17 +154,55 @@ fi
 
 # ----- always: stop and remove the service layer ---------------------------
 log::step "Stopping service"
-if systemctl list-unit-files 2>/dev/null | grep -q '^certautopilot.service'; then
-  systemctl disable --now certautopilot.service 2>/dev/null || true
+
+# `systemctl cat` is the most reliable "does this unit exist" probe —
+# it succeeds iff systemd has a loaded unit file for the name. Using
+# `list-unit-files | grep` is fragile because the format varies across
+# distros and the regex anchors can drift. We try stop + disable
+# loudly (NOT silenced with /dev/null — we want to see failures) so an
+# orphan process doesn't sneak past the uninstaller and leave a
+# port-in-use error on the next install.
+if systemctl cat certautopilot.service >/dev/null 2>&1; then
+  if ! systemctl stop certautopilot.service; then
+    log::warn "systemctl stop certautopilot.service exited non-zero — continuing"
+  fi
+  systemctl disable certautopilot.service >/dev/null 2>&1 || true
   log::ok "certautopilot.service stopped + disabled"
 fi
-if systemctl list-unit-files 2>/dev/null | grep -q '^nginx.service'; then
-  systemctl reload nginx 2>/dev/null || true
+
+# Belt & suspenders: no matter what systemctl said, make sure no
+# /usr/local/bin/certautopilot process is still running. This catches:
+#   (a) orphaned processes from a previous uninstall that removed the
+#       unit file before the process was actually dead;
+#   (b) a crash loop where `Restart=on-failure` restarted the service
+#       faster than `systemctl stop` could complete;
+#   (c) a manually-started binary outside systemd.
+# SIGTERM first, wait, SIGKILL if stubborn.
+if pgrep -f '/usr/local/bin/certautopilot' >/dev/null 2>&1; then
+  log::warn "certautopilot process still running — sending SIGTERM"
+  pkill -TERM -f '/usr/local/bin/certautopilot' 2>/dev/null || true
+  kill_wait=0
+  while [ "$kill_wait" -lt 10 ] && pgrep -f '/usr/local/bin/certautopilot' >/dev/null 2>&1; do
+    sleep 1
+    kill_wait=$(( kill_wait + 1 ))
+  done
+  unset kill_wait
+  if pgrep -f '/usr/local/bin/certautopilot' >/dev/null 2>&1; then
+    log::warn "process still running after 10s — sending SIGKILL"
+    pkill -KILL -f '/usr/local/bin/certautopilot' 2>/dev/null || true
+    sleep 1
+  fi
+  if pgrep -f '/usr/local/bin/certautopilot' >/dev/null 2>&1; then
+    log::warn "unable to kill certautopilot — check manually: ps -fp \$(pgrep -f /usr/local/bin/certautopilot)"
+  else
+    log::ok "stale certautopilot process terminated"
+  fi
 fi
 
 log::step "Removing unit + drop-ins"
 rm -f /etc/systemd/system/certautopilot.service
 systemctl daemon-reload 2>/dev/null || true
+systemctl reset-failed certautopilot.service 2>/dev/null || true
 
 log::step "Removing binary + frontend"
 rm -f /usr/local/bin/certautopilot
@@ -182,8 +220,9 @@ if systemctl is-active --quiet nginx 2>/dev/null; then
     log::warn "nginx -t failed after removing our drop-in; check other conf.d files manually"
 fi
 
-log::step "Removing logrotate"
-rm -f /etc/logrotate.d/certautopilot
+log::step "Removing journald retention drop-in"
+rm -f /etc/systemd/journald.conf.d/10-certautopilot.conf
+systemctl restart systemd-journald 2>/dev/null || true
 
 # ----- purge: data + config + user -----------------------------------------
 if [ "$PURGE" = "1" ]; then
