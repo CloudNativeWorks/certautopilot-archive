@@ -34,6 +34,42 @@ set -Eeuo pipefail
 
 GHCR_REPO=${GHCR_REPO:-cloudnativeworks/standalone/certautopilot}
 
+print_help() {
+  cat <<'EOF'
+CertAutoPilot standalone bootstrap.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+    | sudo bash -s -- --version=<pinned> [install.sh flags...]
+
+Required:
+  --version=<pinned>    Pinned release (e.g. 1.3.12). No "latest" auto-resolve.
+
+Forwarded to install.sh (any of these work):
+  --mongo=local|external
+  --mongo-uri=<uri>                 Required with --mongo=external
+  --mongo-version=<ver>             Default: 7.0
+  --tls=self-signed|provided        Default: self-signed (10-year ECDSA-P256)
+  --cert=<path> --key=<path>        Required with --tls=provided
+  --port=<n>                        Public HTTPS port (default: 443)
+  --backend-port=<n>                Loopback port on the backend (default: 18181)
+  --bind-host=<host>                Bind address (default: 0.0.0.0)
+  --extra-hostnames=a,b,c           Extra DNS SAN entries
+  --no-firewall                     Skip firewalld / ufw port-opening
+  --non-interactive                 Never prompt
+
+Examples:
+  sudo bash -s -- --version=1.3.12 --mongo=local
+  sudo bash -s -- --version=1.3.12 --mongo=external \
+                  --mongo-uri="mongodb://user:pass@db:27017/?authSource=admin"
+  sudo bash -s -- --version=1.3.12 --mongo=local \
+                  --tls=provided --cert=/etc/ssl/certs/foo.pem --key=/etc/ssl/private/foo.key
+
+Docs:
+  https://github.com/CloudNativeWorks/certautopilot-archive
+EOF
+}
+
 VERSION=""
 INSTALL_ARGS=()
 while [ $# -gt 0 ]; do
@@ -46,7 +82,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --help|-h)
-      sed -n '2,35p' "$0"
+      print_help
       exit 0
       ;;
     *)
