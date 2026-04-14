@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# CertAutoPilot standalone uninstaller.
+#
+# Self-contained: does NOT pull anything from GHCR. All uninstall
+# steps are local system operations (systemctl, rm, userdel, apt/dnf
+# purge). Pair with get.sh for install, update.sh for upgrade.
+#
+# Three levels:
+#
+#   (default, no flags)    Stops and removes the service + binary
+#                          + nginx drop-in + systemd unit. Data,
+#                          secrets, KEK, config, TLS, and MongoDB
+#                          are ALL preserved so a subsequent
+#                          get.sh re-install picks up where this
+#                          host left off.
+#
+#   --purge                Also wipes /etc/certautopilot (KEK,
+#                          secrets, config, TLS), /var/lib/
+#                          certautopilot (runtime state, ACME
+#                          cache), /var/log/certautopilot, and
+#                          removes the certautopilot service user.
+#                          MongoDB is left alone.
+#
+#   --purge-db             Also removes the local MongoDB install
+#                          (package + data + mongod.conf + apt/yum
+#                          repo files). Implies --purge for
+#                          everything else.
+#
+#   --yes-i-mean-it        Skip the interactive confirmation
+#                          prompt for any destructive action.
+#                          Required when running non-interactively
+#                          (cron, CI, remote bash pipe).
+#
+# Usage:
+#   # Gentle: keep everything that matters, only removes the service.
+#   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/uninstall.sh \
+#     | sudo bash
+#
+#   # Full wipe (KEK gone — NEVER do this on a host with encrypted data):
+#   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/uninstall.sh \
+#     | sudo bash -s -- --purge --yes-i-mean-it
+#
+#   # Nuclear option (also removes local MongoDB):
+#   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/uninstall.sh \
+#     | sudo bash -s -- --purge --purge-db --yes-i-mean-it
+
+set -Eeuo pipefail
+
+print_help() {
+  cat <<'EOF'
+CertAutoPilot standalone uninstaller.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/uninstall.sh \
+    | sudo bash [-s -- <flags>]
+
+Flags:
+  (none)             Remove service + binary + unit + nginx conf. Data
+                     and secrets preserved; a subsequent install
+                     resumes with the same KEK.
+
+  --purge            Also wipe /etc/certautopilot (incl. KEK, secrets,
+                     TLS, config), /var/lib/certautopilot,
+                     /var/log/certautopilot, and the service user.
+
+  --purge-db         Also remove the local MongoDB package + data +
+                     /etc/mongod.conf + apt/yum repo files.
+                     Implies --purge for everything else.
+
+  --yes-i-mean-it    Skip all confirmation prompts. REQUIRED when
+                     --purge or --purge-db is combined with a piped
+                     curl | bash invocation (no tty).
+
+  --help, -h         Print this text and exit.
+
+WARNINGS:
+  • --purge deletes /etc/certautopilot/secrets.env which holds the
+    KEK. If the host has any envelope-encrypted data (DNS creds,
+    ACME account keys, module secrets) in MongoDB, deleting the KEK
+    makes ALL of that data UNRECOVERABLE, even if you keep mongo.
+  • --purge-db drops the MongoDB package AND /var/lib/mongodb. Any
+    database on this host, including ones unrelated to
+    CertAutoPilot, will be deleted.
+
+Docs:
+  https://github.com/CloudNativeWorks/certautopilot-archive
+EOF
+}
+
+# ----- flag parsing --------------------------------------------------------
+PURGE=0
+PURGE_DB=0
+CONFIRMED=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --purge)         PURGE=1 ;;
+    --purge-db)      PURGE_DB=1; PURGE=1 ;;
+    --yes-i-mean-it) CONFIRMED=1 ;;
+    --help|-h)       print_help; exit 0 ;;
+    *)
+      printf 'unknown flag: %s\n' "$1" >&2
+      printf 'run with --help for usage\n' >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [ "$(id -u)" -ne 0 ]; then
+  printf 'error: must run as root (use: sudo bash ...)\n' >&2
+  exit 2
+fi
+
+# ----- helpers -------------------------------------------------------------
+if [ -t 1 ]; then
+  RST='\033[0m'; RED='\033[31m'; YLW='\033[33m'; BLU='\033[34m'; GRN='\033[32m'
+else
+  RST=''; RED=''; YLW=''; BLU=''; GRN=''
+fi
+log::info() { printf '%b[INFO]%b %s\n' "$BLU" "$RST" "$*"; }
+log::ok()   { printf '%b[ OK ]%b %s\n' "$GRN" "$RST" "$*"; }
+log::warn() { printf '%b[WARN]%b %s\n' "$YLW" "$RST" "$*" >&2; }
+log::step() { printf '\n%b==>%b %s\n' "$BLU" "$RST" "$*"; }
+die()       { printf '%b[ERR ]%b %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+
+confirm_destructive() {
+  local what=$1
+  if [ "$CONFIRMED" = "1" ]; then return 0; fi
+  if [ ! -t 0 ]; then
+    die "refusing to $what without --yes-i-mean-it (no controlling tty detected)"
+  fi
+  local ans
+  read -r -p "About to $what. Type 'yes' to continue: " ans
+  [ "$ans" = "yes" ] || die "aborted by operator"
+}
+
+# ----- pre-flight summary --------------------------------------------------
+log::step "Uninstall plan"
+printf '  binary + service:        %b\n' "${GRN}always removed${RST}"
+printf '  /etc/certautopilot:      %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
+printf '  /var/lib/certautopilot:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
+printf '  /var/log/certautopilot:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
+printf '  certautopilot user/grp:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}deleted${RST}" || printf "${GRN}preserved${RST}")"
+printf '  local MongoDB package:   %b\n' "$([ "$PURGE_DB" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
+printf '  /var/lib/mongodb:        %b\n' "$([ "$PURGE_DB" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
+
+if [ "$PURGE" = "1" ]; then
+  confirm_destructive "PURGE all CertAutoPilot data including the KEK"
+fi
+if [ "$PURGE_DB" = "1" ]; then
+  confirm_destructive "REMOVE local MongoDB (package + all databases on this host)"
+fi
+
+# ----- always: stop and remove the service layer ---------------------------
+log::step "Stopping service"
+if systemctl list-unit-files 2>/dev/null | grep -q '^certautopilot.service'; then
+  systemctl disable --now certautopilot.service 2>/dev/null || true
+  log::ok "certautopilot.service stopped + disabled"
+fi
+if systemctl list-unit-files 2>/dev/null | grep -q '^nginx.service'; then
+  systemctl reload nginx 2>/dev/null || true
+fi
+
+log::step "Removing unit + drop-ins"
+rm -f /etc/systemd/system/certautopilot.service
+systemctl daemon-reload 2>/dev/null || true
+
+log::step "Removing binary + frontend"
+rm -f /usr/local/bin/certautopilot
+rm -f /usr/local/bin/cap-setup
+rm -rf /usr/share/certautopilot/web
+# Keep /usr/share/certautopilot/standalone in purge=0 mode so future
+# bundled runs still have the helper scripts — but remove it on purge.
+
+log::step "Removing nginx drop-in"
+rm -f /etc/nginx/conf.d/certautopilot.conf
+rm -f /etc/nginx/conf.d/certautopilot.conf.example
+rm -f /etc/nginx/conf.d/certautopilot.conf.broken.*
+if systemctl is-active --quiet nginx 2>/dev/null; then
+  nginx -t >/dev/null 2>&1 && systemctl reload nginx || \
+    log::warn "nginx -t failed after removing our drop-in; check other conf.d files manually"
+fi
+
+log::step "Removing logrotate"
+rm -f /etc/logrotate.d/certautopilot
+
+# ----- purge: data + config + user -----------------------------------------
+if [ "$PURGE" = "1" ]; then
+  log::step "Purging /etc/certautopilot (KEK / secrets / config / TLS)"
+  rm -rf /etc/certautopilot
+
+  log::step "Purging /var/lib/certautopilot (runtime state / ACME cache)"
+  rm -rf /var/lib/certautopilot
+
+  log::step "Purging /var/log/certautopilot"
+  rm -rf /var/log/certautopilot
+
+  log::step "Purging /usr/share/certautopilot"
+  rm -rf /usr/share/certautopilot
+
+  log::step "Removing certautopilot system user / group"
+  if id certautopilot >/dev/null 2>&1; then
+    userdel certautopilot 2>/dev/null || true
+  fi
+  if getent group certautopilot >/dev/null 2>&1; then
+    groupdel certautopilot 2>/dev/null || true
+  fi
+fi
+
+# ----- purge-db: local MongoDB ---------------------------------------------
+if [ "$PURGE_DB" = "1" ]; then
+  log::step "Removing MongoDB package + data"
+  systemctl disable --now mongod 2>/dev/null || true
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get purge -y 'mongodb-org*' 'mongodb-mongosh*' 'mongodb-database-tools*' >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    rm -f /etc/apt/sources.list.d/mongodb-org-*.list
+    rm -f /etc/apt/keyrings/mongodb-server-*.gpg
+    apt-get update -qq >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    pm=$(command -v dnf || command -v yum)
+    "$pm" remove -y 'mongodb-org*' >/dev/null 2>&1 || true
+    rm -f /etc/yum.repos.d/mongodb-org-*.repo
+  fi
+  rm -rf /var/lib/mongodb /var/log/mongodb /var/lib/mongo
+  rm -f /etc/mongod.conf /etc/mongod.conf.certautopilot.bak
+  log::ok "MongoDB removed"
+fi
+
+# ----- firewall rule cleanup (best effort) ---------------------------------
+log::step "Removing firewall rule (best effort)"
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+  ufw --force delete allow 443/tcp 2>/dev/null || true
+  ufw --force delete allow 8181/tcp 2>/dev/null || true
+  ufw --force delete allow 8443/tcp 2>/dev/null || true
+fi
+if systemctl is-active --quiet firewalld 2>/dev/null && command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --permanent --remove-port=443/tcp 2>/dev/null || true
+  firewall-cmd --permanent --remove-port=8181/tcp 2>/dev/null || true
+  firewall-cmd --permanent --remove-port=8443/tcp 2>/dev/null || true
+  firewall-cmd --reload >/dev/null 2>&1 || true
+fi
+
+# ----- final residual check ------------------------------------------------
+log::step "Residual check"
+{
+  printf '  /etc/certautopilot:     '
+  [ -e /etc/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  /var/lib/certautopilot: '
+  [ -e /var/lib/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  /var/log/certautopilot: '
+  [ -e /var/log/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  /usr/local/bin/certautopilot: '
+  [ -e /usr/local/bin/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  /etc/systemd/system/certautopilot.service: '
+  [ -e /etc/systemd/system/certautopilot.service ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  /etc/nginx/conf.d/certautopilot.conf: '
+  [ -e /etc/nginx/conf.d/certautopilot.conf ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  certautopilot user: '
+  id certautopilot >/dev/null 2>&1 && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  if [ "$PURGE_DB" = "1" ]; then
+    printf '  mongod binary: '
+    command -v mongod >/dev/null 2>&1 && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+    printf '  /var/lib/mongodb: '
+    [ -e /var/lib/mongodb ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  fi
+}
+
+log::ok "uninstall complete"
+if [ "$PURGE" = "0" ]; then
+  printf '\n'
+  printf '  Data preserved. To reinstall on this host:\n'
+  printf '    curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \\\n'
+  printf '      | sudo bash -s -- --version=<pinned> --mongo=local\n'
+fi
