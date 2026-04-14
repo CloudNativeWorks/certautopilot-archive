@@ -62,13 +62,22 @@ Flags:
   --purge            Also wipe /etc/certautopilot (incl. KEK, secrets,
                      TLS, config), /var/lib/certautopilot,
                      /var/log/certautopilot, and the service user.
+                     If CertAutoPilot also installed the nginx
+                     package (marker file present), remove it too.
+                     Leave nginx alone when the marker is absent —
+                     that means nginx was pre-existing on the host.
+
+  --purge-nginx      Force-remove the nginx package even if we
+                     didn't install it originally. Use this only on
+                     hosts where CertAutoPilot was the sole nginx
+                     consumer. Implies --purge.
 
   --purge-db         Also remove the local MongoDB package + data +
                      /etc/mongod.conf + apt/yum repo files.
                      Implies --purge for everything else.
 
   --yes-i-mean-it    Skip all confirmation prompts. REQUIRED when
-                     --purge or --purge-db is combined with a piped
+                     any destructive flag is combined with a piped
                      curl | bash invocation (no tty).
 
   --help, -h         Print this text and exit.
@@ -90,14 +99,17 @@ EOF
 # ----- flag parsing --------------------------------------------------------
 PURGE=0
 PURGE_DB=0
+PURGE_NGINX=0
+FORCE_PURGE_NGINX=0
 CONFIRMED=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --purge)         PURGE=1 ;;
-    --purge-db)      PURGE_DB=1; PURGE=1 ;;
-    --yes-i-mean-it) CONFIRMED=1 ;;
-    --help|-h)       print_help; exit 0 ;;
+    --purge)             PURGE=1 ;;
+    --purge-db)          PURGE_DB=1; PURGE=1 ;;
+    --purge-nginx)       PURGE_NGINX=1; FORCE_PURGE_NGINX=1; PURGE=1 ;;
+    --yes-i-mean-it)     CONFIRMED=1 ;;
+    --help|-h)           print_help; exit 0 ;;
     *)
       printf 'unknown flag: %s\n' "$1" >&2
       printf 'run with --help for usage\n' >&2
@@ -106,6 +118,19 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# When --purge is set, check for the install-time marker file that
+# nginx::_install_package writes only when WE actually installed
+# nginx. If present, auto-enable nginx purge (user can still opt out
+# with an explicit override, but by default a --purge should return
+# the host to the state it was in before CertAutoPilot). If the
+# marker is missing, nginx was pre-existing and we leave the package
+# alone unless the operator explicitly asked with --purge-nginx.
+if [ "$PURGE" = "1" ] && [ "$FORCE_PURGE_NGINX" = "0" ]; then
+  if [ -f /var/lib/certautopilot/.nginx-installed-by-cap ]; then
+    PURGE_NGINX=1
+  fi
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   printf 'error: must run as root (use: sudo bash ...)\n' >&2
@@ -138,15 +163,28 @@ confirm_destructive() {
 # ----- pre-flight summary --------------------------------------------------
 log::step "Uninstall plan"
 printf '  binary + service:        %b\n' "${GRN}always removed${RST}"
+printf '  nginx drop-in:           %b\n' "${GRN}always removed${RST}"
+printf '  journald retention:      %b\n' "${GRN}always removed${RST}"
 printf '  /etc/certautopilot:      %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
 printf '  /var/lib/certautopilot:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
 printf '  /var/log/certautopilot:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
 printf '  certautopilot user/grp:  %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}deleted${RST}" || printf "${GRN}preserved${RST}")"
+printf '  nginx package:           %b\n' "$(
+  if   [ "$PURGE_NGINX" = "1" ] && [ "$FORCE_PURGE_NGINX" = "1" ]; then printf "${RED}FORCE PURGE (--purge-nginx)${RST}"
+  elif [ "$PURGE_NGINX" = "1" ];                                 then printf "${RED}PURGE${RST} (we installed it)"
+  elif [ "$PURGE" = "1" ] && [ -f /var/lib/certautopilot/.nginx-installed-by-cap ]; then printf "${YLW}PURGE${RST}"
+  elif [ "$PURGE" = "1" ];                                       then printf "${GRN}preserved${RST} (pre-existing, not ours)"
+  else                                                                printf "${GRN}preserved${RST}"
+  fi
+)"
 printf '  local MongoDB package:   %b\n' "$([ "$PURGE_DB" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
 printf '  /var/lib/mongodb:        %b\n' "$([ "$PURGE_DB" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
 
 if [ "$PURGE" = "1" ]; then
   confirm_destructive "PURGE all CertAutoPilot data including the KEK"
+fi
+if [ "$PURGE_NGINX" = "1" ]; then
+  confirm_destructive "REMOVE the nginx package from this host"
 fi
 if [ "$PURGE_DB" = "1" ]; then
   confirm_destructive "REMOVE local MongoDB (package + all databases on this host)"
@@ -199,6 +237,14 @@ if pgrep -f '/usr/local/bin/certautopilot' >/dev/null 2>&1; then
   fi
 fi
 
+log::step "Stopping + removing backup timer"
+if systemctl cat certautopilot-backup.timer >/dev/null 2>&1; then
+  systemctl disable --now certautopilot-backup.timer 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/certautopilot-backup.timer \
+      /etc/systemd/system/certautopilot-backup.service \
+      /usr/local/bin/certautopilot-backup
+
 log::step "Removing unit + drop-ins"
 rm -f /etc/systemd/system/certautopilot.service
 systemctl daemon-reload 2>/dev/null || true
@@ -238,6 +284,9 @@ if [ "$PURGE" = "1" ]; then
   log::step "Purging /usr/share/certautopilot"
   rm -rf /usr/share/certautopilot
 
+  log::step "Purging /var/backups/certautopilot"
+  rm -rf /var/backups/certautopilot
+
   log::step "Removing certautopilot system user / group"
   if id certautopilot >/dev/null 2>&1; then
     userdel certautopilot 2>/dev/null || true
@@ -245,6 +294,26 @@ if [ "$PURGE" = "1" ]; then
   if getent group certautopilot >/dev/null 2>&1; then
     groupdel certautopilot 2>/dev/null || true
   fi
+fi
+
+# ----- purge nginx (only if we installed it or --purge-nginx) -------------
+if [ "$PURGE_NGINX" = "1" ]; then
+  log::step "Removing nginx package"
+  systemctl disable --now nginx 2>/dev/null || true
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get purge -y nginx nginx-light nginx-common nginx-core libnginx-mod-http-echo >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    pm=$(command -v dnf || command -v yum)
+    "$pm" remove -y nginx nginx-core nginx-filesystem >/dev/null 2>&1 || true
+  fi
+  # Restore the original nginx.conf if we commented its server block
+  # on a RHEL-family install.
+  if [ -f /etc/nginx/nginx.conf.certautopilot.bak ]; then
+    mv -f /etc/nginx/nginx.conf.certautopilot.bak /etc/nginx/nginx.conf 2>/dev/null || true
+  fi
+  rm -rf /etc/nginx /var/log/nginx /var/cache/nginx
+  log::ok "nginx removed"
 fi
 
 # ----- purge-db: local MongoDB ---------------------------------------------
@@ -298,6 +367,12 @@ log::step "Residual check"
   [ -e /etc/nginx/conf.d/certautopilot.conf ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
   printf '  certautopilot user: '
   id certautopilot >/dev/null 2>&1 && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  if [ "$PURGE_NGINX" = "1" ]; then
+    printf '  nginx binary: '
+    command -v nginx >/dev/null 2>&1 && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+    printf '  /etc/nginx: '
+    [ -e /etc/nginx ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  fi
   if [ "$PURGE_DB" = "1" ]; then
     printf '  mongod binary: '
     command -v mongod >/dev/null 2>&1 && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
