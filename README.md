@@ -26,15 +26,9 @@ AlmaLinux 9+, Debian 12+, Ubuntu 22.04+).
 
 ## Install — `get.sh`
 
-### Simplest case
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-  | sudo bash -s -- --version=1.3.16 --mongo=local
-```
-
-`--version=<pinned>` is required. There is no `latest` auto-resolve —
-every install pins an explicit version by design.
+`--version=<pinned>` is required for every install. There is no
+`latest` auto-resolve — every release pins an explicit version by
+design.
 
 > **Security:** `get.sh` needs root (writes `/etc`, creates the service
 > user, installs systemd units). The CertAutoPilot backend then runs
@@ -48,21 +42,122 @@ every install pins an explicit version by design.
 > exported by `get.sh` just before exec). This keeps the pinned-version
 > contract and the SHA256 integrity check as the only supported path.
 
+### Choose a KEK backend before installing
+
+CertAutoPilot envelope-encrypts every field-level secret in MongoDB
+(ACME keys, DNS credentials, module secrets, license blob, …) under a
+**Key Encryption Key**. Pick how the KEK is stored before you run the
+bootstrap — **this choice is immutable** after first install (locked
+in MongoDB via the `kek_install` singleton), so changing it later
+requires a planned migration.
+
+| | `env` (default) | `pkcs11` |
+|---|---|---|
+| Where is the KEK? | Raw hex bytes in `/etc/certautopilot/secrets.env` (mode 0600). | Inside an HSM token; never leaves the device. |
+| Install prereqs | None beyond the OS. | Vendor PKCS#11 SDK installed and HSM reachable from the host. |
+| Threat model | Root-on-host = full compromise. | Root-on-host alone cannot exfiltrate the KEK. |
+| Backup story | Back up `secrets.env` alongside MongoDB dumps. | HSM-native (vendor clustering / key export to a wrapped blob). |
+| Typical fit | Homelabs, single-VM prod, CI, small multi-VM fleets. | Regulated environments, FIPS 140-2/3 requirements, HSM already in use. |
+
+Below: one quickstart block per provider. Everything else on this page
+(external MongoDB, multi-VM, TLS, custom ports, upgrade) applies to
+either backend — pick your provider flow here, then layer on flags
+from the later sections as needed.
+
+### Quickstart — env provider (default)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- --version=1.4.0 --mongo=local
+```
+
+The bootstrap provisions a local MongoDB with SCRAM auth, generates a
+random 32-byte AES-256 KEK plus JWT secret and API-key pepper, writes
+`/etc/certautopilot/secrets.env` (mode 0600), installs nginx with a
+10-year self-signed TLS cert, and starts the service. `--kek-provider`
+defaults to `env`, so no extra flags are needed for the default path.
+
+Use this backend when you don't have an HSM. Its full threat model
+assumes that root on the host = full compromise — back up
+`secrets.env` to a separate trust boundary so a lost host doesn't lose
+your data.
+
+### Quickstart — PKCS#11 provider (HSM-backed KEK)
+
+The HSM's vendor SDK (SoftHSM2 for dev, Thales Luna client, AWS
+CloudHSM client, Fortanix DSM agent, …) must be installed on the host
+separately — every vendor has its own install procedure. See
+<https://certautopilot.com/docs/encryption/pkcs11-vendors.html> for
+per-vendor notes. Once the vendor bits are in place, one command
+installs CertAutoPilot on top:
+
+```bash
+# Inline PIN (one-liner — PIN visible in /proc/<pid>/cmdline during install
+# only; persists afterward only in /etc/certautopilot/secrets.env mode 0600):
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.4.0 --mongo=local \
+      --kek-provider=pkcs11 \
+      --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
+      --pkcs11-token-label=certautopilot-prod \
+      --pkcs11-pin='<HSM_USER_PIN>'
+```
+
+```bash
+# PIN from a mode-0600 file (production-grade — the PIN never appears in
+# argv or shell history):
+umask 077
+printf '%s' "$HSM_PIN" > /tmp/cap-pin
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.4.0 --mongo=local \
+      --kek-provider=pkcs11 \
+      --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
+      --pkcs11-token-label=certautopilot \
+      --pkcs11-pin-file=/tmp/cap-pin
+shred -u /tmp/cap-pin
+```
+
+Between MongoDB bootstrap and service start, the installer runs
+`certautopilot kek pkcs11-init --version=1`: it probes HSM
+capabilities (`CKM_AES_GCM`, key-generation privileges), generates the
+initial AES-256 v1 key inside the HSM, and writes the immutable
+`kek_install` lock. A probe failure aborts the install before any
+persistent state is committed.
+
+The PIN is copied once to `/etc/certautopilot/secrets.env` (mode 0600,
+owned by the `certautopilot` service user). Systemd loads it via
+`EnvironmentFile=` on every service start, so reboots and
+`systemctl restart` work without re-supplying the PIN. Treat
+`secrets.env` as a root-level credential and back it up alongside the
+HSM slot metadata.
+
+> **`--pkcs11-module` and `--pkcs11-token-label` are NOT locked** —
+> they can be edited in `/etc/certautopilot/config.yaml` post-install
+> if the new module + token still contain the SAME keys (e.g. a
+> library path change, or mirroring HA to a different token). Run
+> `sudo certautopilot kek verify` after every edit.
+
 ### External MongoDB
+
+Either provider can point at an existing MongoDB instead of letting
+the installer provision one locally:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.3.16 \
+      --version=1.4.0 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017"
 ```
 
-The installer parses the URI into individual `host` / `port` /
-`username` / `password` fields — the full URI is never persisted,
-because Viper's `AutomaticEnv` can't bind a unified `database.uri`
-field (no `SetDefault` for it in the backend) so individual fields
-are the only shape the backend actually reads.
+The full URI is persisted verbatim to `secrets.env` as
+`CERTAUTOPILOT_DATABASE_URI` so multi-host replica sets, `authSource`,
+`tls=true`, and any other query-string options survive the install.
+Credentials MUST be URL-encoded per RFC 3986 — any raw `@`, `:`, `/`,
+`?`, `#`, or `%` in the username or password will break parsing. Add
+`--kek-provider=pkcs11` + the `--pkcs11-*` flags above to combine
+external MongoDB with HSM-backed KEKs.
 
 ### Multi-VM deployment (2+ hosts, shared external MongoDB)
 
@@ -78,7 +173,7 @@ module secrets, license API key, …) the other hosts already wrote.
 # On cap-a (first host):
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.3.22 \
+      --version=1.4.0 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017"
 
@@ -91,7 +186,7 @@ shred -u /tmp/cap-shared.env
 # On cap-b (and every additional host):
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.3.22 \
+      --version=1.4.0 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017" \
       --secrets-from=/tmp/cap-shared.env
@@ -115,56 +210,12 @@ Full procedure (TLS options, setup wizard, backups, upgrade order,
 troubleshooting) is documented at
 <https://certautopilot.com/docs/deployment/multi-vm.html>.
 
-### PKCS#11 provider (HSM-backed KEK)
-
-CertAutoPilot can wrap KEKs with a key stored in an HSM instead of
-raw bytes in `secrets.env`. The vendor SDK (SoftHSM2, Thales Luna,
-AWS CloudHSM, Fortanix DSM, …) must be installed separately — each
-vendor has its own install procedure; see
-<https://certautopilot.com/docs/encryption/pkcs11-vendors.html>.
-`get.sh` then installs CertAutoPilot on top of that in one command.
-
-Pick one of the two PIN ingress modes:
-
-```bash
-# Inline PIN (quickest; PIN visible in /proc/<pid>/cmdline during install
-# only, persists afterward only in /etc/certautopilot/secrets.env mode 0600):
-curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-  | sudo bash -s -- \
-      --version=1.3.22 --mongo=local \
-      --kek-provider=pkcs11 \
-      --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
-      --pkcs11-token-label=certautopilot-prod \
-      --pkcs11-pin='<HSM_USER_PIN>'
-```
-
-```bash
-# PIN from file (production-grade; the PIN never appears in argv or
-# shell history):
-umask 077
-printf '%s' "$HSM_PIN" > /tmp/cap-pin
-curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-  | sudo bash -s -- \
-      --version=1.3.22 --mongo=local \
-      --kek-provider=pkcs11 \
-      --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
-      --pkcs11-token-label=certautopilot \
-      --pkcs11-pin-file=/tmp/cap-pin
-shred -u /tmp/cap-pin
-```
-
-After install, the PIN lives only in `/etc/certautopilot/secrets.env`
-(mode 0600, owned by the `certautopilot` service user). Systemd
-loads it via `EnvironmentFile=` on every service start, so reboots
-and `systemctl restart` pick it up automatically — the PIN does not
-need to be re-supplied.
-
 ### User-provided TLS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.3.16 \
+      --version=1.4.0 \
       --mongo=local \
       --tls=provided \
       --cert=/etc/ssl/certs/cert.example.com.pem \
@@ -176,7 +227,7 @@ curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-arch
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.3.16 \
+      --version=1.4.0 \
       --mongo=local \
       --port=8443 \
       --backend-port=18181
@@ -234,7 +285,7 @@ In-place upgrade to a newer pinned version:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/update.sh \
-  | sudo bash -s -- --version=1.3.17
+  | sudo bash -s -- --version=1.4.0
 ```
 
 What it does:
@@ -255,10 +306,13 @@ Everything else is preserved byte-for-byte:
 - `/etc/nginx/conf.d/certautopilot.conf`
 - MongoDB data and users
 
-> **If you need to change install-time flags** (ports, Mongo mode, TLS
-> mode, `--bind-host`, etc.), use `get.sh` instead. The bundled
-> `install.sh` is idempotent: it re-renders anything the new flags
-> affect while still preserving secrets.
+> **`update.sh` is for binary + frontend refresh only.** Topology and
+> config flags — `--mongo`, `--mongo-uri`, `--tls`, `--cert`, `--key`,
+> `--port`, `--bind-host`, `--extra-hostnames`, `--kek-provider`,
+> `--enable-backup`, etc. — are NOT honored here. Rerun `get.sh` with
+> the new flags to change any of them; the bundled `install.sh` is
+> idempotent and re-renders just the parts the new flags affect while
+> preserving every secret on disk.
 
 ---
 

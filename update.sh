@@ -43,6 +43,15 @@ What it does:
       - starts certautopilot.service
       - probes backend + nginx /readyz
 
+Scope — what update.sh does NOT do:
+  update.sh is a binary + frontend refresh only. Topology and config
+  flags (--mongo, --mongo-uri, --tls, --cert, --key, --port,
+  --bind-host, --extra-hostnames, --kek-provider, --enable-backup, …)
+  are NOT honored here — pass those to get.sh if you need to change
+  anything beyond the version. The bundled install.sh is idempotent:
+  it re-renders just what the new flags affect while preserving every
+  secret on disk.
+
 Preserved across update:
   • /etc/certautopilot/secrets.env (KEK / JWT / pepper / Mongo creds)
   • /etc/certautopilot/config.yaml

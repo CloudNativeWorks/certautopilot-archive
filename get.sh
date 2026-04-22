@@ -83,6 +83,14 @@ Forwarded to install.sh (any of these work):
                                     --mongo=local — external deployments
                                     own their backup stack.
 
+Pick a KEK backend before installing — the choice (env vs pkcs11) is
+immutable after first install (locked in MongoDB via the kek_install
+singleton). env: raw hex bytes in /etc/certautopilot/secrets.env (no
+HSM needed). pkcs11: AES key lives inside an HSM token, never leaves
+the device (requires the vendor PKCS#11 SDK on the host). Changing
+provider later requires a planned migration — see the provider-migration
+guide on https://certautopilot.com/docs/encryption/provider-migration.html.
+
 Examples:
   # Env provider, local MongoDB:
   sudo bash -s -- --version=1.3.12 --mongo=local
@@ -121,6 +129,10 @@ Examples:
                   --secrets-from=/tmp/cap-shared-secrets.env
 
 Notes:
+  * MongoDB connection strings must be URL-encoded per RFC 3986. Raw '@',
+    ':', '/', '?', '#', or '%' inside the username or password will break
+    URI parsing — percent-encode them (e.g. 'p@ss' -> 'p%40ss'). See
+    https://www.mongodb.com/docs/manual/reference/connection-string/.
   * The PKCS#11 vendor SDK (SoftHSM2, Thales Luna client, AWS CloudHSM
     client, Fortanix DSM, etc.) must be installed separately before
     invoking this bootstrap — each vendor has its own install procedure.
