@@ -36,6 +36,18 @@ curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-arch
 `--version=<pinned>` is required. There is no `latest` auto-resolve —
 every install pins an explicit version by design.
 
+> **Security:** `get.sh` needs root (writes `/etc`, creates the service
+> user, installs systemd units). The CertAutoPilot backend then runs
+> as a dedicated non-root system user (`certautopilot`, nologin shell,
+> no home directory) under a hardened systemd unit
+> (`NoNewPrivileges`, `ProtectSystem=strict`, `LimitCORE=0`). Root is
+> never used at runtime.
+>
+> `install.sh` — the script inside the tarball — refuses to run unless
+> invoked via `get.sh` (the sentinel `CAP_INVOKED_FROM_BOOTSTRAP=1` is
+> exported by `get.sh` just before exec). This keeps the pinned-version
+> contract and the SHA256 integrity check as the only supported path.
+
 ### External MongoDB
 
 ```bash
@@ -51,6 +63,101 @@ The installer parses the URI into individual `host` / `port` /
 because Viper's `AutomaticEnv` can't bind a unified `database.uri`
 field (no `SetDefault` for it in the backend) so individual fields
 are the only shape the backend actually reads.
+
+### Multi-VM deployment (2+ hosts, shared external MongoDB)
+
+Running two or more CertAutoPilot hosts against a single external
+MongoDB is supported, but each host generates its own random KEK /
+JWT / API-key pepper on first install. Every host after the first
+MUST adopt the first host's `/etc/certautopilot/secrets.env` via the
+`--secrets-from=<path>` flag — otherwise the new host cannot decrypt
+any envelope-encrypted field (ACME private keys, DNS credentials,
+module secrets, license API key, …) the other hosts already wrote.
+
+```bash
+# On cap-a (first host):
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.3.22 \
+      --mongo=external \
+      --mongo-uri="mongodb://user:pass@db.internal:27017"
+
+# Copy secrets.env from cap-a to cap-b (use SSH; treat this file as a
+# root-level credential — whoever holds it can decrypt everything).
+scp cap-a:/etc/certautopilot/secrets.env /tmp/cap-shared.env
+scp /tmp/cap-shared.env cap-b:/tmp/
+shred -u /tmp/cap-shared.env
+
+# On cap-b (and every additional host):
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.3.22 \
+      --mongo=external \
+      --mongo-uri="mongodb://user:pass@db.internal:27017" \
+      --secrets-from=/tmp/cap-shared.env
+
+sudo shred -u /tmp/cap-shared.env
+```
+
+> **secrets.env holds the KEK.** Transfer only over SSH, install with
+> mode `0600`, and shred temporary copies immediately. For production
+> consider an ephemeral shared-secret channel (Vault, 1Password shared
+> vault, SealedSecrets export) instead of `scp`.
+
+**Run the initial admin wizard on exactly ONE host.** The backend
+guards setup with a cluster-wide `$setOnInsert` flag, so concurrent
+wizard submissions from two hosts still produce exactly one admin +
+one default project — the loser receives
+`400 setup already completed`. Every host beyond the first sees the
+flag already set and redirects `/setup` to the login page.
+
+Full procedure (TLS options, setup wizard, backups, upgrade order,
+troubleshooting) is documented at
+<https://certautopilot.com/docs/deployment/multi-vm.html>.
+
+### PKCS#11 provider (HSM-backed KEK)
+
+CertAutoPilot can wrap KEKs with a key stored in an HSM instead of
+raw bytes in `secrets.env`. The vendor SDK (SoftHSM2, Thales Luna,
+AWS CloudHSM, Fortanix DSM, …) must be installed separately — each
+vendor has its own install procedure; see
+<https://certautopilot.com/docs/encryption/pkcs11-vendors.html>.
+`get.sh` then installs CertAutoPilot on top of that in one command.
+
+Pick one of the two PIN ingress modes:
+
+```bash
+# Inline PIN (quickest; PIN visible in /proc/<pid>/cmdline during install
+# only, persists afterward only in /etc/certautopilot/secrets.env mode 0600):
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.3.22 --mongo=local \
+      --kek-provider=pkcs11 \
+      --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
+      --pkcs11-token-label=certautopilot-prod \
+      --pkcs11-pin='<HSM_USER_PIN>'
+```
+
+```bash
+# PIN from file (production-grade; the PIN never appears in argv or
+# shell history):
+umask 077
+printf '%s' "$HSM_PIN" > /tmp/cap-pin
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.3.22 --mongo=local \
+      --kek-provider=pkcs11 \
+      --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
+      --pkcs11-token-label=certautopilot \
+      --pkcs11-pin-file=/tmp/cap-pin
+shred -u /tmp/cap-pin
+```
+
+After install, the PIN lives only in `/etc/certautopilot/secrets.env`
+(mode 0600, owned by the `certautopilot` service user). Systemd
+loads it via `EnvironmentFile=` on every service start, so reboots
+and `systemctl restart` pick it up automatically — the PIN does not
+need to be re-supplied.
 
 ### User-provided TLS
 
@@ -77,6 +184,47 @@ curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-arch
 
 Every flag after `--version=` is forwarded verbatim to the bundled
 `install.sh`. Run `get.sh --help` for the full flag list.
+
+---
+
+## Operator helpers — what `get.sh` / `update.sh` install alongside the backend
+
+Every install/update drops the backend binary and — when the operator
+opts in — a small backup helper alongside it.
+
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/certautopilot` | The backend binary (what `certautopilot.service` runs). All KEK lifecycle commands live under `certautopilot kek <subcommand>`. |
+| `/usr/local/bin/certautopilot-backup` | mongodump wrapper the `certautopilot-backup.timer` fires daily. Installed only when the operator passes `--enable-backup` **and** `--mongo=local`. External-mongo deployments own their own backup stack; local-mongo installs without `--enable-backup` stay backup-free so operators with their own cron/restic/Ansible orchestration aren't doubled up. |
+
+`update.sh` refreshes both on every version bump and preserves the
+operator's prior `--enable-backup` choice — if the timer was enabled
+before, it stays enabled after upgrade; if it was absent, upgrade
+doesn't silently install one.
+
+### KEK rotation on a single host
+
+```bash
+# 1. Add the new key material to secrets.env (env provider only).
+printf '\nCERTAUTOPILOT_ENCRYPTION_ENV_KEK_V2=%s\n' "$(openssl rand -hex 32)" \
+  | sudo tee -a /etc/certautopilot/secrets.env >/dev/null
+sudo systemctl restart certautopilot
+
+# 2. Verify fleet has loaded V2, then rotate. The keystore in MongoDB
+#    is authoritative for the active version — no per-host config bump.
+sudo certautopilot kek verify --target=2
+sudo certautopilot kek rotate --from-version=1 --to-version=2
+sudo certautopilot kek status    # poll until completed
+
+# 3. Restart every node so it picks up the new active version from
+#    the keystore.
+sudo systemctl restart certautopilot
+```
+
+For a multi-VM deployment, loop step 1 over every host before step 2,
+then loop step 3 after rotation completes. Full procedure (including
+PKCS#11 and K8s paths) at
+<https://certautopilot.com/docs/encryption/kek-rotation.html>.
 
 ---
 
@@ -151,6 +299,15 @@ database and its users stay in place.
 > MongoDB. Only use `--purge` when you're sure either (a) there is
 > no encrypted data on this host, or (b) you have restored the KEK
 > from a backup elsewhere.
+
+> **Multi-VM note:** Every host in a multi-VM deployment holds the
+> same KEK in its local `secrets.env`. `--purge` on one host deletes
+> the file only there — the surviving hosts still hold a working
+> copy, so the cluster's encrypted data remains decryptable and new
+> hosts can be bootstrapped with `--secrets-from` pointing at any
+> surviving host's file. But `--purge`'ing EVERY host without first
+> exporting a copy of `secrets.env` elsewhere is equivalent to losing
+> the KEK entirely — there is no recovery path.
 
 ### Level 3 — Purge + drop local MongoDB
 

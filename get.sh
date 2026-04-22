@@ -55,15 +55,82 @@ Forwarded to install.sh (any of these work):
   --backend-port=<n>                Loopback port on the backend (default: 18181)
   --bind-host=<host>                Bind address (default: 0.0.0.0)
   --extra-hostnames=a,b,c           Extra DNS SAN entries
+  --kek-provider=env|pkcs11         Default: env. pkcs11 locks the install
+                                    to an HSM-backed provider (see below).
+  --pkcs11-module=<path>            Vendor PKCS#11 shared library (required
+                                    with --kek-provider=pkcs11).
+  --pkcs11-token-label=<lbl>        HSM token label (required with pkcs11).
+  --pkcs11-pin=<value>              HSM user PIN inline (argv-visible during
+                                    install only; persists afterward only in
+                                    /etc/certautopilot/secrets.env mode 0600).
+  --pkcs11-pin-file=<path>          HSM user PIN read from a mode-0600 file
+                                    (recommended for production — the PIN
+                                    never appears in argv or shell history).
+  --secrets-from=<path>             Adopt an existing /etc/certautopilot/
+                                    secrets.env verbatim instead of minting
+                                    fresh KEK/JWT/pepper. REQUIRED on the
+                                    2nd+ host of a multi-VM deployment that
+                                    shares one external MongoDB — otherwise
+                                    each host would generate its own KEK and
+                                    be unable to decrypt data written by the
+                                    others.
   --no-firewall                     Skip firewalld / ufw port-opening
   --non-interactive                 Never prompt
+  --enable-backup                   Install the nightly mongodump timer
+                                    (03:15 local, 7-day retention under
+                                    /var/backups/certautopilot/). Opt-in;
+                                    off by default. Only honored with
+                                    --mongo=local — external deployments
+                                    own their backup stack.
 
 Examples:
+  # Env provider, local MongoDB:
   sudo bash -s -- --version=1.3.12 --mongo=local
+
+  # Env provider, external MongoDB:
   sudo bash -s -- --version=1.3.12 --mongo=external \
                   --mongo-uri="mongodb://user:pass@db:27017/?authSource=admin"
+
+  # Env provider, local MongoDB + nightly mongodump backup timer:
+  sudo bash -s -- --version=1.3.12 --mongo=local --enable-backup
+
+  # Env provider, provided TLS cert:
   sudo bash -s -- --version=1.3.12 --mongo=local \
                   --tls=provided --cert=/etc/ssl/certs/foo.pem --key=/etc/ssl/private/foo.key
+
+  # PKCS#11 provider, inline PIN (quick-and-dirty — PIN in argv during install):
+  sudo bash -s -- --version=1.3.12 --mongo=local \
+                  --kek-provider=pkcs11 \
+                  --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
+                  --pkcs11-token-label=certautopilot-prod \
+                  --pkcs11-pin='<HSM_USER_PIN>'
+
+  # PKCS#11 provider, PIN from a mode-0600 file (production-grade):
+  umask 077 && printf '%s' "$HSM_PIN" > /tmp/cap-pin
+  sudo bash -s -- --version=1.3.12 --mongo=local \
+                  --kek-provider=pkcs11 \
+                  --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
+                  --pkcs11-token-label=certautopilot \
+                  --pkcs11-pin-file=/tmp/cap-pin
+  shred -u /tmp/cap-pin
+
+  # Multi-VM: second host joining the same external MongoDB, adopting the
+  # first host's secrets.env (copy it over beforehand with scp).
+  sudo bash -s -- --version=1.3.12 --mongo=external \
+                  --mongo-uri="mongodb://user:pass@db:27017/?authSource=admin" \
+                  --secrets-from=/tmp/cap-shared-secrets.env
+
+Notes:
+  * The PKCS#11 vendor SDK (SoftHSM2, Thales Luna client, AWS CloudHSM
+    client, Fortanix DSM, etc.) must be installed separately before
+    invoking this bootstrap — each vendor has its own install procedure.
+    See https://certautopilot.com/docs/encryption/pkcs11-vendors.html.
+  * The PIN persists in /etc/certautopilot/secrets.env (0600, owned by
+    the certautopilot service user). Systemd loads it via EnvironmentFile
+    on every service start, so restarts and reboots keep working without
+    re-supplying the PIN.
+  * The service runs as a dedicated non-root system user (certautopilot).
+    Root is required only for install, update, and uninstall scripts.
 
 Docs:
   https://github.com/CloudNativeWorks/certautopilot-archive
@@ -215,4 +282,9 @@ echo "[get] handing off to $BUNDLE_DIR/install.sh"
 # Release the WORKDIR EXIT trap — after exec the bundle dir must survive
 # long enough for install.sh to read templates/, lib/, and web/ from it.
 trap - EXIT
+# Sentinel that tells install.sh it was invoked from this bootstrap
+# (the single legitimate entry point). install.sh refuses to run
+# without it, except when an operator explicitly sets the variable
+# themselves for internal dev/CI workflows.
+export CAP_INVOKED_FROM_BOOTSTRAP=1
 exec "$BUNDLE_DIR/install.sh" --version="$VERSION" "${INSTALL_ARGS[@]}"
