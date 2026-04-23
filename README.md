@@ -256,25 +256,41 @@ doesn't silently install one.
 ### KEK rotation on a single host
 
 ```bash
-# 1. Add the new key material to secrets.env (env provider only).
+# 1. Add the new key material to secrets.env (env provider only) and
+#    restart so the service loads V2 alongside V1.
 printf '\nCERTAUTOPILOT_ENCRYPTION_ENV_KEK_V2=%s\n' "$(openssl rand -hex 32)" \
   | sudo tee -a /etc/certautopilot/secrets.env >/dev/null
 sudo systemctl restart certautopilot
 
-# 2. Verify fleet has loaded V2, then rotate. The keystore in MongoDB
-#    is authoritative for the active version — no per-host config bump.
+# 2. Verify every live process has V2 LOADED (not "already current" —
+#    the keystore's active row only flips at rotation finalize).
 sudo certautopilot kek verify --target=2
+
+# 3. Rotate. The keystore in MongoDB is authoritative for the active
+#    version; the rewrap explicitly targets V2 so envelopes stay
+#    consistent with their outer kek_version tag regardless of what
+#    any process happens to have as current mid-rotation.
 sudo certautopilot kek rotate --from-version=1 --to-version=2
 sudo certautopilot kek status    # poll until completed
 
-# 3. Restart every node so it picks up the new active version from
-#    the keystore.
-sudo systemctl restart certautopilot
+# 4. Wait ~30s — each node's heartbeat tick detects the keystore flip
+#    and hot-reloads V2 as current WITHOUT a restart. `kek status` and
+#    the Settings → KEK versions page show the fleet converging.
+#    (Optional forced-sync: `sudo systemctl restart certautopilot` if
+#    you can't tolerate the heartbeat cadence lag.)
+
+# 5. (After your backup window) retire V1. The command refuses with a
+#    clear error if any live node still reports V1 as its current —
+#    combined with step 4's auto-reload, this is observably safe.
+sudo certautopilot kek remove --version=1
+sudo sed -i '/^CERTAUTOPILOT_ENCRYPTION_ENV_KEK_V1=/d' /etc/certautopilot/secrets.env
+sudo systemctl restart certautopilot   # drops V1 from process memory
 ```
 
-For a multi-VM deployment, loop step 1 over every host before step 2,
-then loop step 3 after rotation completes. Full procedure (including
-PKCS#11 and K8s paths) at
+For a multi-VM deployment, loop step 1 over every host before step 2.
+Step 4 is automatic fleet-wide (heartbeat tick polls the shared
+keystore); no per-host post-rotation restart is required. Full
+procedure (including PKCS#11 and K8s paths) at
 <https://certautopilot.com/docs/encryption/kek-rotation.html>.
 
 ---
