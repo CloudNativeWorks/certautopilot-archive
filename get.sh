@@ -13,11 +13,11 @@
 #
 # Usage (typical):
 #   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-#     | sudo bash -s -- --version=1.3.12 --mongo=local
+#     | sudo bash -s -- --version=1.5.52 --mongo=local
 #
 # Usage with external MongoDB:
 #   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-#     | sudo bash -s -- --version=1.3.12 \
+#     | sudo bash -s -- --version=1.5.52 \
 #         --mongo=external \
 #         --mongo-uri="mongodb://user:pass@db.example.com:27017/?authSource=admin"
 #
@@ -76,6 +76,24 @@ Forwarded to install.sh (any of these work):
                                     others.
   --no-firewall                     Skip firewalld / ufw port-opening
   --non-interactive                 Never prompt
+
+Multi-node orchestration (run ONCE on the first node; it installs the rest
+over SSH — 3+ nodes get a MongoDB replica set `caprs` on the first three
+nodes; 2 nodes with local mongo is refused, use --mongo=external or 3 nodes):
+  --nodes=ip1,ip2,ip3               Node list, THIS machine first (M1). M1
+                                    mints the shared secrets + mongo keyfile,
+                                    ships them over SSH and drives the
+                                    install on every node.
+  --ssh-user=<u>                    SSH login user (default: root; non-root
+                                    needs passwordless sudo)
+  --ssh-port=<n>                    SSH port (default: 22)
+  --ssh-key=<path>                  Private key for SSH auth
+  --ssh-password=<p>                Password auth via sshpass (argv-visible;
+                                    prefer --ssh-key or --ssh-bootstrap)
+  --ssh-bootstrap                   Mint an ed25519 key on M1 and push it to
+                                    every node (one password prompt per node;
+                                    auto-enabled when no key/password given
+                                    and a TTY is available)
   --enable-backup                   Install the nightly mongodump timer
                                     (03:15 local, 7-day retention under
                                     /var/backups/certautopilot/). Opt-in;
@@ -93,21 +111,21 @@ guide on https://certautopilot.com/docs/encryption/provider-migration.html.
 
 Examples:
   # Env provider, local MongoDB:
-  sudo bash -s -- --version=1.3.12 --mongo=local
+  sudo bash -s -- --version=1.5.52 --mongo=local
 
   # Env provider, external MongoDB:
-  sudo bash -s -- --version=1.3.12 --mongo=external \
+  sudo bash -s -- --version=1.5.52 --mongo=external \
                   --mongo-uri="mongodb://user:pass@db:27017/?authSource=admin"
 
   # Env provider, local MongoDB + nightly mongodump backup timer:
-  sudo bash -s -- --version=1.3.12 --mongo=local --enable-backup
+  sudo bash -s -- --version=1.5.52 --mongo=local --enable-backup
 
   # Env provider, provided TLS cert:
-  sudo bash -s -- --version=1.3.12 --mongo=local \
+  sudo bash -s -- --version=1.5.52 --mongo=local \
                   --tls=provided --cert=/etc/ssl/certs/foo.pem --key=/etc/ssl/private/foo.key
 
   # PKCS#11 provider, inline PIN (quick-and-dirty — PIN in argv during install):
-  sudo bash -s -- --version=1.3.12 --mongo=local \
+  sudo bash -s -- --version=1.5.52 --mongo=local \
                   --kek-provider=pkcs11 \
                   --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
                   --pkcs11-token-label=certautopilot-prod \
@@ -115,7 +133,7 @@ Examples:
 
   # PKCS#11 provider, PIN from a mode-0600 file (production-grade):
   umask 077 && printf '%s' "$HSM_PIN" > /tmp/cap-pin
-  sudo bash -s -- --version=1.3.12 --mongo=local \
+  sudo bash -s -- --version=1.5.52 --mongo=local \
                   --kek-provider=pkcs11 \
                   --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
                   --pkcs11-token-label=certautopilot \
@@ -124,7 +142,7 @@ Examples:
 
   # Multi-VM: second host joining the same external MongoDB, adopting the
   # first host's secrets.env (copy it over beforehand with scp).
-  sudo bash -s -- --version=1.3.12 --mongo=external \
+  sudo bash -s -- --version=1.5.52 --mongo=external \
                   --mongo-uri="mongodb://user:pass@db:27017/?authSource=admin" \
                   --secrets-from=/tmp/cap-shared-secrets.env
 
@@ -172,7 +190,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$VERSION" ]; then
-  printf 'error: --version=<pinned> is required (example: --version=1.3.12)\n' >&2
+  printf 'error: --version=<pinned> is required (example: --version=1.5.52)\n' >&2
   printf 'no latest auto-resolve — every install pins an explicit version.\n' >&2
   exit 2
 fi

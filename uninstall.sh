@@ -163,6 +163,7 @@ confirm_destructive() {
 # ----- pre-flight summary --------------------------------------------------
 log::step "Uninstall plan"
 printf '  binary + service:        %b\n' "${GRN}always removed${RST}"
+printf '  operator helpers:        %b\n' "${GRN}always removed${RST} (cap, cap-kek, cap-cluster)"
 printf '  nginx drop-in:           %b\n' "${GRN}always removed${RST}"
 printf '  journald retention:      %b\n' "${GRN}always removed${RST}"
 printf '  /etc/certautopilot:      %b\n' "$([ "$PURGE" = "1" ] && printf "${RED}PURGE${RST}" || printf "${GRN}preserved${RST}")"
@@ -254,6 +255,26 @@ log::step "Removing binary + frontend"
 rm -f /usr/local/bin/certautopilot
 rm -f /usr/local/bin/cap-setup
 rm -rf /usr/share/certautopilot/web
+
+log::step "Removing operator helpers"
+# Mirrors helpers::remove in the bundled installer (deploy/standalone/lib/helpers.sh).
+# /usr/local/bin/cap is removed ONLY when it carries our marker — the name collides
+# with Capistrano, and a foreign `cap` must never be deleted. cap-kek / cap-cluster
+# are unique names and unconditionally ours. Idempotent on reruns.
+if [ -f /usr/local/bin/cap ] && grep -q "CertAutoPilot operator wrapper" /usr/local/bin/cap 2>/dev/null; then
+  rm -f /usr/local/bin/cap
+  log::ok "removed /usr/local/bin/cap"
+elif [ -e /usr/local/bin/cap ] || [ -L /usr/local/bin/cap ]; then
+  log::warn "/usr/local/bin/cap is not the CertAutoPilot wrapper — left untouched"
+fi
+for helper in /usr/local/bin/cap-kek /usr/local/bin/cap-cluster; do
+  if [ -f "$helper" ]; then
+    rm -f "$helper"
+    log::ok "removed $helper"
+  fi
+done
+rm -f /etc/certautopilot/kek-rotation.md   # the rotation runbook (the directory itself is purge-only)
+rm -f /etc/profile.d/cap-kek.sh            # legacy location from earlier builds
 # Keep /usr/share/certautopilot/standalone in purge=0 mode so future
 # bundled runs still have the helper scripts — but remove it on purge.
 
@@ -319,7 +340,21 @@ fi
 # ----- purge-db: local MongoDB ---------------------------------------------
 if [ "$PURGE_DB" = "1" ]; then
   log::step "Removing MongoDB package + data"
+  if grep -q 'replSetName' /etc/mongod.conf 2>/dev/null; then
+    log::warn "this mongod is a MEMBER of the caprs replica set — purging it degrades the set."
+    log::warn "For a clean removal, first run rs.remove('<this-host>:27017') from the PRIMARY,"
+    log::warn "or uninstall ALL members if you are tearing the whole cluster down."
+  fi
   systemctl disable --now mongod 2>/dev/null || true
+  # Replica-set artifacts (no-ops on single-node installs). Kept in
+  # PARITY with the bundled deploy/standalone/uninstall.sh — same flags,
+  # same semantics; update both together.
+  systemctl disable --now certautopilot-disable-thp.service 2>/dev/null || true
+  rm -f /etc/systemd/system/certautopilot-disable-thp.service
+  rm -rf /etc/systemd/system/mongod.service.d
+  rm -f /etc/sysctl.d/99-certautopilot-mongo.conf
+  rm -rf /etc/certautopilot-mongo
+  systemctl daemon-reload 2>/dev/null || true
   if command -v apt-get >/dev/null 2>&1; then
     apt-get purge -y 'mongodb-org*' 'mongodb-mongosh*' 'mongodb-database-tools*' >/dev/null 2>&1 || true
     apt-get autoremove -y >/dev/null 2>&1 || true
@@ -361,6 +396,8 @@ log::step "Residual check"
   [ -e /var/log/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
   printf '  /usr/local/bin/certautopilot: '
   [ -e /usr/local/bin/certautopilot ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
+  printf '  operator helpers (cap-kek, cap-cluster): '
+  { [ -e /usr/local/bin/cap-kek ] || [ -e /usr/local/bin/cap-cluster ]; } && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
   printf '  /etc/systemd/system/certautopilot.service: '
   [ -e /etc/systemd/system/certautopilot.service ] && printf '%bexists%b\n' "$YLW" "$RST" || printf '%bgone%b\n' "$GRN" "$RST"
   printf '  /etc/nginx/conf.d/certautopilot.conf: '

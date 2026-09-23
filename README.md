@@ -68,7 +68,7 @@ from the later sections as needed.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
-  | sudo bash -s -- --version=1.4.0 --mongo=local
+  | sudo bash -s -- --version=1.5.52 --mongo=local
 ```
 
 The bootstrap provisions a local MongoDB with SCRAM auth, generates a
@@ -96,7 +96,7 @@ installs CertAutoPilot on top:
 # only; persists afterward only in /etc/certautopilot/secrets.env mode 0600):
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 --mongo=local \
+      --version=1.5.52 --mongo=local \
       --kek-provider=pkcs11 \
       --pkcs11-module=/usr/lib/softhsm/libsofthsm2.so \
       --pkcs11-token-label=certautopilot-prod \
@@ -110,7 +110,7 @@ umask 077
 printf '%s' "$HSM_PIN" > /tmp/cap-pin
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 --mongo=local \
+      --version=1.5.52 --mongo=local \
       --kek-provider=pkcs11 \
       --pkcs11-module=/opt/thales/lib/libCryptoki2_64.so \
       --pkcs11-token-label=certautopilot \
@@ -146,7 +146,7 @@ the installer provision one locally:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 \
+      --version=1.5.52 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017"
 ```
@@ -158,6 +158,33 @@ Credentials MUST be URL-encoded per RFC 3986 — any raw `@`, `:`, `/`,
 `?`, `#`, or `%` in the username or password will break parsing. Add
 `--kek-provider=pkcs11` + the `--pkcs11-*` flags above to combine
 external MongoDB with HSM-backed KEKs.
+
+### Multi-node cluster with one command (3+ hosts, built-in MongoDB replica set)
+
+From the FIRST host, a single command installs the whole cluster over SSH:
+the first three nodes form a keyfile-authenticated MongoDB replica set
+(`caprs`, MongoDB 8.0), every node runs CertAutoPilot against it, and the
+shared secrets + mongo keyfile are minted once and shipped automatically —
+no manual `secrets.env` copying.
+
+```bash
+# On cap-a (M1 — must be the FIRST entry of --nodes):
+curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
+  | sudo bash -s -- \
+      --version=1.5.52 \
+      --nodes=10.0.0.11,10.0.0.12,10.0.0.13
+```
+
+Notes:
+- With no `--ssh-key`/`--ssh-password`, the installer mints an ed25519 key
+  and pushes it to each node (one password prompt per node).
+- Open **27017/tcp between the three mongo nodes** in your network ACLs /
+  cloud security groups (the installer handles firewalld/ufw when active,
+  and warns loudly when it cannot).
+- 2 nodes with local mongo is refused (no quorum) — use 3+ nodes or
+  `--mongo=external`. Nodes 4+ run CertAutoPilot without a local mongod.
+- Updates/uninstalls run per node: mongo-less nodes and SECONDARY members
+  first, M1 last.
 
 ### Multi-VM deployment (2+ hosts, shared external MongoDB)
 
@@ -173,7 +200,7 @@ module secrets, license API key, …) the other hosts already wrote.
 # On cap-a (first host):
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 \
+      --version=1.5.52 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017"
 
@@ -186,7 +213,7 @@ shred -u /tmp/cap-shared.env
 # On cap-b (and every additional host):
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 \
+      --version=1.5.52 \
       --mongo=external \
       --mongo-uri="mongodb://user:pass@db.internal:27017" \
       --secrets-from=/tmp/cap-shared.env
@@ -215,7 +242,7 @@ troubleshooting) is documented at
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 \
+      --version=1.5.52 \
       --mongo=local \
       --tls=provided \
       --cert=/etc/ssl/certs/cert.example.com.pem \
@@ -227,7 +254,7 @@ curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-arch
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/get.sh \
   | sudo bash -s -- \
-      --version=1.4.0 \
+      --version=1.5.52 \
       --mongo=local \
       --port=8443 \
       --backend-port=18181
@@ -301,7 +328,7 @@ In-place upgrade to a newer pinned version:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/update.sh \
-  | sudo bash -s -- --version=1.4.0
+  | sudo bash -s -- --version=1.5.52
 ```
 
 What it does:

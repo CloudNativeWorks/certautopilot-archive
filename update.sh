@@ -12,7 +12,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/CloudNativeWorks/certautopilot-archive/main/update.sh \
-#     | sudo bash -s -- --version=1.3.16
+#     | sudo bash -s -- --version=1.5.52
 #
 # Required environment: root + curl + tar + awk + sha256sum.
 
@@ -29,7 +29,7 @@ Usage:
     | sudo bash -s -- --version=<pinned>
 
 Required:
-  --version=<pinned>    Pinned release to upgrade to (e.g. 1.3.17).
+  --version=<pinned>    Pinned release to upgrade to (e.g. 1.5.52).
                         No "latest" auto-resolve.
 
 What it does:
@@ -51,6 +51,11 @@ Scope — what update.sh does NOT do:
   anything beyond the version. The bundled install.sh is idempotent:
   it re-renders just what the new flags affect while preserving every
   secret on disk.
+
+  Multi-node clusters (--nodes installs): run this update on EVERY
+  node — mongo-less nodes and SECONDARY replica-set members first,
+  M1 (the primary) last. --nodes and the --ssh-* flags are
+  install-time only and are not honored here.
 
 Preserved across update:
   • /etc/certautopilot/secrets.env (KEK / JWT / pepper / Mongo creds)
@@ -82,7 +87,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$VERSION" ]; then
-  printf 'error: --version=<pinned> is required (example: --version=1.3.16)\n' >&2
+  printf 'error: --version=<pinned> is required (example: --version=1.5.52)\n' >&2
   printf 'no latest auto-resolve — every update pins an explicit version.\n' >&2
   exit 2
 fi
