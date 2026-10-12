@@ -22,6 +22,31 @@ No runtime dependencies. No `oras`, no `jq`, no `docker`. Just `curl`,
 every supported distro (RHEL 9+, Oracle Linux 9+, Rocky 9+,
 AlmaLinux 9+, Debian 12+, Ubuntu 22.04+).
 
+## CertAutoPilot OS — the appliance image
+
+The [releases of this repository](https://github.com/CloudNativeWorks/certautopilot-archive/releases)
+named `cap-os-v<version>` carry **CertAutoPilot OS**, the ready-made
+appliance image (Debian 13, the CertAutoPilot backend and web UI, nginx,
+MongoDB 8.0 and a management console) — no Linux host to prepare and no
+installer script to run:
+
+| File | Use it for |
+|---|---|
+| `cap-os-<ver>.iso` | bare metal and any hypervisor (BIOS and UEFI) |
+| `cap-os-<ver>.ova` | VMware vSphere / Workstation |
+| `cap-os_<ver>.qcow2` | KVM, Proxmox, OpenStack |
+
+Verify a download with the CertAutoPilot OS release signing key, fingerprint
+`68FA 9CAD B2C0 5E10 4AE0 B1BB ECEF 4DC4 BC8D B41C`:
+
+```bash
+gpg --import cap-os-release-signing.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Installation, `cluster init` and three-node clusters:
+<https://www.certautopilot.com/docs/deployment/appliance>.
+
 ---
 
 ## Install — `get.sh`
